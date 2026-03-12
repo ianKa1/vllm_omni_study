@@ -1,0 +1,199 @@
+# =============================================================================
+# BAGEL-7B-MoT Stage Config — tuned for single L40S (46 GB)
+#
+# PIPELINE OVERVIEW
+# -----------------
+# BAGEL uses a 2-stage architecture:
+#
+#   User prompt
+#       │
+#       │ expand_cfg_prompts()
+#       │ → generates a SECOND "negative" companion prompt for CFG guidance
+#       │
+#       ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │ STAGE 0 — AR Thinker (BagelForConditionalGeneration)│
+#   │                                                     │
+#   │  • Runs the 7B language model on BOTH prompts       │
+#   │  • Does PREFILL only (max_tokens=1 for text2img)    │
+#   │  • Output: KV caches (not text tokens)              │
+#   │  • Sends KV caches → Stage 1 via omni_kv_config     │
+#   └─────────────────────────────────────────────────────┘
+#       │ need_send_cache: true
+#       │ KV caches transferred via SharedMemoryConnector
+#       ▼
+#   ┌─────────────────────────────────────────────────────┐
+#   │ STAGE 1 — DiT (Diffusion Transformer)               │
+#   │                                                     │
+#   │  • Receives KV caches from Stage 0                  │
+#   │  • collect_cfg_kv_caches() pairs positive+negative  │
+#   │  • Runs N denoising steps with CFG guidance:        │
+#   │    output = neg + scale × (pos − neg)               │
+#   │  • Output: PNG image                                │
+#   └─────────────────────────────────────────────────────┘
+#
+# MEMORY BUDGET (L40S 46 GB)
+# --------------------------
+#   Stage 0:  0.28 × 46 GB ≈ 13 GB   (7B fp8 ≈ 7 GB + KV cache buffer)
+#   Stage 1:  0.62 × 46 GB ≈ 28 GB   (DiT weights + activations)
+#   Total:    0.90 × 46 GB ≈ 41 GB   ✓ fits within 46 GB
+# =============================================================================
+
+
+
+
+
+
+stage_args:
+
+  # ===========================================================================
+  # STAGE 0 — AR Thinker
+  #
+  # What it does:
+  #   Runs the BAGEL 7B language model as a text encoder. For text2img, it
+  #   only does PREFILL (the calling code sets max_tokens=1), so it reads
+  #   the prompt and builds a KV cache, but barely generates any text.
+  #   Two prompts go through here in parallel:
+  #     1. The user's actual prompt ("a cup of coffee...")  → "gen" KV cache
+  #     2. A negative/empty prompt                          → "cfg_text" KV cache
+  #   Both KV caches are then shipped to Stage 1 for CFG-guided denoising.
+  #
+  # Key settings:
+  #   engine_output_type: text     → output token IDs back to orchestrator
+  #   omni_kv_config.need_send_cache → after prefill, also ship KV cache to DiT
+  #   kv_transfer_criteria: prefill_finished → send KV right after prefill
+  # ===========================================================================
+  - stage_id: 0
+    stage_type: llm
+
+    # prompt_expand_func runs in the ORCHESTRATOR before submitting to this stage.
+    # It generates the CFG companion (negative prompt) from the user prompt.
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
+
+    runtime:
+      process: true           # run in a separate OS process
+      devices: "0"            # use GPU 0
+      # 2 = 1 user prompt + 1 CFG negative prompt (both processed simultaneously)
+      max_batch_size: 2
+
+    engine_args:
+      model_stage: thinker
+      model_arch: BagelForConditionalGeneration
+      worker_type: ar                      # autoregressive worker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.28         # ~13 GB on L40S
+      enforce_eager: true                  # no CUDA graph capture (saves memory)
+      trust_remote_code: true
+      engine_output_type: text             # return token IDs to orchestrator
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 4096         # reduced from 32768 to save memory
+      tensor_parallel_size: 1
+      quantization: "fp8"                  # halves thinker weight memory: 14 GB → 7 GB
+      # omni_kv_config: instructs the AR worker to ALSO transfer its KV cache
+      # to the DiT stage after prefill is complete.
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished
+
+    # This stage emits text (for img2text/text2text modes)
+    # AND sends KV caches (for text2img mode) — both happen simultaneously.
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048          # overridden to 1 by end2end.py for text2img
+      seed: 52
+      detokenize: true
+      repetition_penalty: 1.05
+
+
+  # ===========================================================================
+  # STAGE 1 — DiT (Diffusion Transformer)
+  #
+  # What it does:
+  #   Receives the two KV caches from Stage 0 (positive + negative) and runs
+  #   the diffusion denoising loop. At each of the N denoising steps it:
+  #     1. Runs the DiT conditioned on the POSITIVE KV cache  → pos_output
+  #     2. Runs the DiT conditioned on the NEGATIVE KV cache  → neg_output
+  #     3. Combines:  final = neg + cfg_scale × (pos − neg)
+  #   After N steps, decodes the latent through the VAE → RGB image.
+  #
+  # Key settings:
+  #   engine_input_source: [0]           → wait for Stage 0 to finish
+  #   cfg_kv_collect_func                → pairs up pos/neg KV caches from Stage 0
+  #   omni_kv_config.need_recv_cache     → receive KV caches via kv_transfer_manager
+  #   engine_output_type: image          → final output is a PIL image
+  # ===========================================================================
+  - stage_id: 1
+    stage_type: diffusion        # uses OmniDiffusion engine, not OmniLLM
+
+    # cfg_kv_collect_func runs inside the DiT stage worker to fetch
+    # both the "gen" and "cfg_text" KV caches from the transfer manager.
+    cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
+
+    runtime:
+      process: true              # separate OS process from Stage 0
+      devices: "0"               # same GPU (shared with Stage 0 sequentially)
+      max_batch_size: 1
+
+    engine_args:
+      model_stage: dit
+      gpu_memory_utilization: 0.62   # ~28 GB on L40S
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: image      # output PIL image to orchestrator
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      # omni_kv_config: instructs the DiT worker to RECEIVE KV caches
+      # that were sent by Stage 0's need_send_cache mechanism.
+      omni_kv_config:
+        need_recv_cache: true
+
+    # engine_input_source tells the orchestrator:
+    # "don't submit to Stage 1 until Stage 0 has finished for this request"
+    engine_input_source: [0]
+
+    final_output: true
+    final_output_type: image      # this is the terminal output returned to the user
+    is_comprehension: false
+
+    default_sampling_params:
+      seed: 52
+      num_inference_steps: 30     # reduced from 50 for speed; increase for quality
+
+
+# =============================================================================
+# RUNTIME — edge definitions and connector configuration
+#
+# edges: defines the directed DAG between stages.
+#   window_size: -1 means "trigger Stage 1 only after Stage 0 fully completes"
+#   (as opposed to streaming partial results)
+#
+# connectors: SharedMemoryConnector is the default for same-node transfer.
+#   It writes serialized payloads to /dev/shm and passes a handle via ZMQ.
+#   For cross-node deployments, replace with MooncakeStoreConnector or PrisKVConnector.
+# =============================================================================
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1   # wait for full upstream completion before triggering downstream
+    max_inflight: 1   # process one request at a time within each stage
+
+  connectors:
+    shared_memory_connector:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536   # payloads > 64 KB go through /dev/shm
+
+  edges:
+    - from: 0      # Stage 0 (AR thinker) → Stage 1 (DiT)
+      to: 1
+      window_size: -1
